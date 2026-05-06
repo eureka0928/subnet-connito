@@ -951,13 +951,15 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # gated, preserving the file-race protection that used to live
             # at this point in the loop.
             #
-            # Fresh 32-bit random seed each cycle. Read by every validator at
+            # Fresh 16-bit random seed each cycle. Read by every validator at
             # the next Submission start via `get_combined_validator_seed`,
             # which sha256s the sorted concat — so cohort-wide assignment
             # rotates each cycle even when miner/validator membership is
-            # static. 32 bits = up to 10 decimal digits, ≤14 bytes of JSON,
-            # well within the 128-byte commit budget shared with model_hash.
-            new_miner_seed = secrets.randbits(32)
+            # static. 16 bits = up to 5 decimal digits, ≤9 bytes of JSON; the
+            # downstream sha256 supplies the entropy `assign_miners_to_validators`
+            # actually needs, so going wider just costs commit-budget bytes
+            # for no shuffle-quality gain.
+            new_miner_seed = secrets.randbits(16)
             chain_submitter.async_commit(ValidatorChainCommit(
                 model_hash=current_model_hash,
                 global_ver=global_opt_step,
