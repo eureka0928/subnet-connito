@@ -15,9 +15,30 @@ from connito.shared.app_logging import structlog
 from connito.shared.dataloader import get_dataloader
 from connito.shared.evaluate import evaluate_model
 from connito.shared.helper import parse_dynamic_filename
-from connito.shared.telemetry import track_eval_latency, track_model_load_latency
+from connito.shared.telemetry import (
+    EvalFailureReason,
+    VALIDATOR_BASELINE_LOSS,
+    VALIDATOR_MINER_VAL_LOSS,
+    inc_error,
+    inc_eval_failure,
+    track_eval_latency,
+    track_model_load_latency,
+)
 
 logger = structlog.get_logger(__name__)
+
+
+# Maps the short reason strings returned by `validate_miner_submission` onto
+# the closed `EvalFailureReason` enum used by the
+# `validator_miner_eval_failures_total` Counter. Keeping the mapping here (and
+# not in telemetry.py) so the validator-side semantics live with the eval code.
+_VALIDATION_FAIL_TO_REASON: dict[str, EvalFailureReason] = {
+    "no_chain_commit": "unknown",
+    "signature": "corrupt",
+    "hash": "checksum",
+    "expert_group_or_nan": "corrupt",
+    "unknown": "unknown",
+}
 
 
 def cleanup_non_top_submissions(
@@ -257,6 +278,39 @@ def finalize_round_scores(
         except Exception as e:
             logger.warning(
                 "finalize_round_scores: persist_atomic failed",
+                round_id=round_obj.round_id, error=str(e),
+            )
+
+    # Flip the round's journal to `finalized=true` and rewrite it so the
+    # post-finalize file on disk reflects the rank-based scores. The
+    # journal stays on disk after this — pruned by age along with the
+    # aggregator entries it backs (see `prune_before_round` callers in
+    # run.py).
+    journal_path = getattr(round_obj, "journal_path", None)
+    if journal_path is not None:
+        try:
+            from connito.validator import round_journal as _rj
+            scored_set, failed_set = round_obj.processed_uids_snapshot()
+            with round_obj._lock:  # noqa: SLF001
+                journal_scores = dict(round_obj.scores)
+                journal_uid_to_hotkey = dict(round_obj.uid_to_hotkey)
+            _rj.write_atomic(
+                journal_path,
+                _rj.RoundJournal(
+                    round_id=round_obj.round_id,
+                    uid_to_hotkey=journal_uid_to_hotkey,
+                    scores=journal_scores,
+                    scored_uids=tuple(sorted(scored_set)),
+                    failed_uids=tuple(sorted(failed_set)),
+                    validation_failed_uids=tuple(sorted(validation_failed)),
+                    freeze_zero_uids=tuple(sorted(freeze_zero)),
+                    freeze_zero_hotkeys=dict(freeze_hotkeys),
+                    finalized=True,
+                ),
+            )
+        except Exception as e:
+            logger.warning(
+                "finalize_round_scores: journal flip-to-finalized failed",
                 round_id=round_obj.round_id, error=str(e),
             )
 
@@ -569,7 +623,7 @@ def load_model_from_path(path: str, base_model: nn.Module, device: torch.device)
     return model.to(device)
 
 
-async def _evaluate_on_fresh_loader(
+def _evaluate_on_fresh_loader_sync(
     *,
     config,
     tokenizer,
@@ -585,8 +639,7 @@ async def _evaluate_on_fresh_loader(
     Every caller shares the same `combinded_seed`, so the baseline and all
     miner evals see the same batches — the deltas are comparable.
     """
-    dataloader = await asyncio.to_thread(
-        get_dataloader,
+    dataloader = get_dataloader(
         config=config,
         tokenizer=tokenizer,
         seed=combinded_seed,
@@ -599,9 +652,120 @@ async def _evaluate_on_fresh_loader(
         return evaluate_model(step, model, dataloader, device, max_eval_batches, rank)
 
     try:
-        return await asyncio.to_thread(_run)
+        return _run()
     finally:
         del dataloader
+
+
+def evaluate_one_miner_sync(
+    *,
+    config,
+    model_path: str | Path,
+    uid: int,
+    hotkey: str,
+    base_model: nn.Module,
+    tokenizer,
+    combined_seed: str,
+    device: torch.device,
+    baseline_loss: float,
+    step: int,
+    round_id: int | None = None,
+    max_eval_batches: int = EVAL_MAX_BATCHES,
+    rank: int | None = None,
+) -> "MinerEvalJob | None":
+    """Synchronous variant of `evaluate_one_miner`.
+
+    All GPU work — `load_model_from_path`, dataloader build, and
+    `evaluate_model` — happens inside this single function so the caller
+    can run the entire eval as one `asyncio.to_thread` task.
+
+    That structure matters for cancellation: tasks scheduled via
+    `asyncio.to_thread` are not cancellable, so when an outer
+    `asyncio.wait_for` timeout fires, the awaiter is cancelled but the
+    underlying thread keeps running. If the thread is partway through
+    `copy.deepcopy(base_model)` or `model.to(device)`, the GPU memory it
+    has allocated is still live; starting a second eval in parallel will
+    OOM. Funnelling the whole eval through one `to_thread` task lets
+    callers acquire any GPU lock INSIDE that thread — the lock release
+    then tracks actual GPU completion (not awaiter cancellation), so the
+    next eval naturally blocks on lock acquisition until the previous
+    thread drains.
+    """
+    try:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        miner_model = load_model_from_path(str(model_path), base_model, device)
+
+        try:
+            metrics = _evaluate_on_fresh_loader_sync(
+                config=config,
+                tokenizer=tokenizer,
+                combinded_seed=combined_seed,
+                step=step,
+                model=miner_model,
+                device=device,
+                max_eval_batches=max_eval_batches,
+                rank=rank,
+            )
+        finally:
+            del miner_model
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        val_loss = float(metrics.get("val_loss", 100))
+        delta = max(0.0, baseline_loss - val_loss)
+        # `score` is the per-round delta-based signal stored on
+        # `MinerEvalJob` and recorded in `round.scores` by the caller via
+        # `mark_scored`. The aggregator is intentionally NOT updated here
+        # — `finalize_round_scores` is the sole writer for this round's
+        # aggregator entries (see PR #93 introducing rank-based scoring).
+        score = delta ** 1.2
+        # Publish per-miner val_loss to Prometheus so external aggregators
+        # can render the leaderboard without a per-validator HTTP scrape.
+        # Best-effort — Prometheus exposition is purely an observability
+        # side-effect and must never block scoring.
+        try:
+            VALIDATOR_MINER_VAL_LOSS.labels(miner_uid=str(int(uid))).set(float(val_loss))
+        except Exception:
+            pass
+        logger.info(
+            "evaluate_one_miner: complete",
+            uid=int(uid),
+            hotkey=hotkey[:6],
+            val_loss=round(val_loss, 4),
+            baseline_loss=round(baseline_loss, 4),
+            delta=round(delta, 4),
+            score=round(score, 6),
+            round_id=round_id,
+        )
+        return MinerEvalJob(
+            uid=int(uid),
+            hotkey=hotkey,
+            model_path=str(model_path),
+            step=int(step),
+            score=float(score),
+        )
+    except torch.cuda.OutOfMemoryError:
+        logger.error("evaluate_one_miner: OOM", uid=int(uid))
+        inc_eval_failure(int(uid), "oom")
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return None
+    except (ValueError, RuntimeError, EOFError) as e:
+        # ValueError: load_model_from_path's "Unsupported checkpoint format" /
+        # empty state_dict guard. RuntimeError / EOFError: torch.load rejecting
+        # truncated or malformed payloads. All three signal a corrupt download.
+        logger.exception("evaluate_one_miner: corrupt checkpoint", uid=int(uid), error=str(e))
+        inc_eval_failure(int(uid), "corrupt")
+        return None
+    except Exception as e:
+        logger.exception("evaluate_one_miner: failed", uid=int(uid), error=str(e))
+        inc_eval_failure(int(uid), "unknown")
+        return None
 
 
 async def evaluate_one_miner(
@@ -635,65 +799,27 @@ async def evaluate_one_miner(
 
     Returns a `MinerEvalJob` on success (so the caller can later use
     `model_path` for gradient aggregation), or None on failure.
+
+    Implementation: thin wrapper that runs `evaluate_one_miner_sync`
+    inside a single `asyncio.to_thread` task. See that function's
+    docstring for why the whole eval is funnelled through one thread.
     """
-    try:
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        miner_model = await asyncio.to_thread(load_model_from_path, str(model_path), base_model, device)
-
-        try:
-            metrics = await _evaluate_on_fresh_loader(
-                config=config,
-                tokenizer=tokenizer,
-                combinded_seed=combined_seed,
-                step=step,
-                model=miner_model,
-                device=device,
-                max_eval_batches=max_eval_batches,
-                rank=rank,
-            )
-        finally:
-            del miner_model
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        val_loss = float(metrics.get("val_loss", 100))
-        delta = max(0.0, baseline_loss - val_loss)
-        # `score` is the per-round delta-based signal stored on
-        # `MinerEvalJob` and recorded in `round.scores` by the caller via
-        # `mark_scored`. The aggregator is intentionally NOT updated here
-        # — `finalize_round_scores` is the sole writer for this round's
-        # aggregator entries (see PR #93 introducing rank-based scoring).
-        score = delta ** 1.2
-        logger.info(
-            "evaluate_one_miner: complete",
-            uid=int(uid),
-            hotkey=hotkey[:6],
-            val_loss=round(val_loss, 4),
-            baseline_loss=round(baseline_loss, 4),
-            delta=round(delta, 4),
-            score=round(score, 6),
-            round_id=round_id,
-        )
-        return MinerEvalJob(
-            uid=int(uid),
-            hotkey=hotkey,
-            model_path=str(model_path),
-            step=int(step),
-            score=float(score),
-        )
-    except torch.cuda.OutOfMemoryError:
-        logger.error("evaluate_one_miner: OOM", uid=int(uid))
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return None
-    except Exception as e:
-        logger.exception("evaluate_one_miner: failed", uid=int(uid), error=str(e))
-        return None
+    return await asyncio.to_thread(
+        evaluate_one_miner_sync,
+        config=config,
+        model_path=model_path,
+        uid=uid,
+        hotkey=hotkey,
+        base_model=base_model,
+        tokenizer=tokenizer,
+        combined_seed=combined_seed,
+        device=device,
+        baseline_loss=baseline_loss,
+        step=step,
+        round_id=round_id,
+        max_eval_batches=max_eval_batches,
+        rank=rank,
+    )
 
 
 async def evaluate_foreground_round(
@@ -750,6 +876,15 @@ async def evaluate_foreground_round(
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    # Publish to Prometheus so external aggregators can derive
+    # `delta_loss = max(0, baseline - val_loss)` per miner. Best-effort
+    # — Prometheus exposition is purely an observability side-effect
+    # and must never block scoring.
+    try:
+        VALIDATOR_BASELINE_LOSS.set(float(baseline_loss))
+    except Exception:
+        pass
 
     foreground_set = set(round_obj.foreground_uids)
     completed: list[MinerEvalJob] = completed_out if completed_out is not None else []
@@ -841,8 +976,8 @@ async def evaluate_foreground_round(
                     round_id=round_obj.round_id,
                     reason=fail_reason,
                 )
-                from connito.shared.telemetry import inc_error
                 inc_error(component="foreground_eval", kind="validation")
+                inc_eval_failure(int(uid), _VALIDATION_FAIL_TO_REASON.get(fail_reason, "unknown"))
                 round_obj.mark_validation_failed(uid)
                 _prune_non_top_after_eval(
                     config=config,
@@ -882,6 +1017,7 @@ async def evaluate_foreground_round(
                     uid=uid, hotkey=hotkey[:6],
                     timeout_sec=round(effective_timeout, 2),
                 )
+                inc_eval_failure(int(uid), "timeout")
                 round_obj.mark_failed(uid)
                 _prune_non_top_after_eval(
                     config=config,
@@ -890,6 +1026,7 @@ async def evaluate_foreground_round(
                 continue
             except Exception as e:
                 logger.exception("foreground eval: unexpected failure", uid=uid, error=str(e))
+                inc_eval_failure(int(uid), "unknown")
                 round_obj.mark_failed(uid)
                 _prune_non_top_after_eval(
                     config=config,
