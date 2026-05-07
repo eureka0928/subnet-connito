@@ -13,7 +13,7 @@ import torch.nn as nn
 
 from connito.shared.app_logging import structlog
 from connito.shared.dataloader import get_dataloader
-from connito.shared.evaluate import evaluate_model
+from connito.shared.evaluate import EvalDeadlineExceeded, evaluate_model
 from connito.shared.helper import parse_dynamic_filename
 from connito.shared.telemetry import (
     EvalFailureReason,
@@ -623,6 +623,44 @@ def load_model_from_path(path: str, base_model: nn.Module, device: torch.device)
     return model.to(device)
 
 
+def _evaluate_on_fresh_loader_sync(
+    *,
+    config,
+    tokenizer,
+    combinded_seed: str,
+    step: int,
+    model: nn.Module,
+    device: torch.device,
+    max_eval_batches: int,
+    rank: int | None = None,
+    deadline_monotonic: float | None = None,
+) -> dict:
+    """Synchronous variant of `_evaluate_on_fresh_loader`.
+
+    Builds the dataloader and runs `evaluate_model` on the same thread.
+    Used by `evaluate_one_miner_sync` so the entire GPU pipeline can run
+    inside a single threadpool task that owns `gpu_eval_lock`. The async
+    variant below is a thin wrapper around this for foreground callers.
+    """
+    dataloader = get_dataloader(
+        config=config,
+        tokenizer=tokenizer,
+        seed=combinded_seed,
+        rank=0,
+        world_size=config.dataloader.world_size,
+    )
+    try:
+        @track_eval_latency()
+        def _run():
+            return evaluate_model(
+                step, model, dataloader, device, max_eval_batches, rank,
+                deadline_monotonic=deadline_monotonic,
+            )
+        return _run()
+    finally:
+        del dataloader
+
+
 async def _evaluate_on_fresh_loader(
     *,
     config,
@@ -634,31 +672,23 @@ async def _evaluate_on_fresh_loader(
     max_eval_batches: int,
     rank: int | None = None,
 ) -> dict:
-    """Build a fresh eval dataloader and run evaluate_model on the given model.
-
-    Every caller shares the same `combinded_seed`, so the baseline and all
-    miner evals see the same batches — the deltas are comparable.
+    """Async wrapper around `_evaluate_on_fresh_loader_sync` for callers
+    that don't manage their own threadpool task (e.g., foreground eval).
     """
-    dataloader = await asyncio.to_thread(
-        get_dataloader,
+    return await asyncio.to_thread(
+        _evaluate_on_fresh_loader_sync,
         config=config,
         tokenizer=tokenizer,
-        seed=combinded_seed,
-        rank=0,
-        world_size=config.dataloader.world_size,
+        combinded_seed=combinded_seed,
+        step=step,
+        model=model,
+        device=device,
+        max_eval_batches=max_eval_batches,
+        rank=rank,
     )
 
-    @track_eval_latency()
-    def _run():
-        return evaluate_model(step, model, dataloader, device, max_eval_batches, rank)
 
-    try:
-        return await asyncio.to_thread(_run)
-    finally:
-        del dataloader
-
-
-async def evaluate_one_miner(
+def evaluate_one_miner_sync(
     *,
     config,
     model_path: str | Path,
@@ -673,32 +703,33 @@ async def evaluate_one_miner(
     round_id: int | None = None,
     max_eval_batches: int = EVAL_MAX_BATCHES,
     rank: int | None = None,
+    deadline_monotonic: float | None = None,
 ) -> "MinerEvalJob | None":
-    """Evaluate a single miner and return the per-round delta-based score.
+    """Synchronous variant of `evaluate_one_miner`.
 
-    Shared between foreground (`evaluate_foreground_round`) and the
-    `BackgroundEvalWorker`. `base_model` is treated as read-only — caller
-    is responsible for not mutating it across calls so successive miners
-    see an identical baseline.
+    Runs the full GPU pipeline (load_state_dict → dataloader build →
+    evaluate_model) on the calling thread, so the caller can wrap the
+    whole call in `with gpu_eval_lock:` and have lock release coupled
+    to actual GPU completion (not awaiter cancellation).
 
-    The returned `MinerEvalJob.score` is the raw `(baseline_loss - val_loss)
-    ** 1.2` signal; the caller stores it in `round.scores` via
-    `mark_scored`. The actual reward score sent to the chain is rank-based
-    and written by `finalize_round_scores` at end of round — this function
-    does not touch the global `MinerScoreAggregator`.
+    `deadline_monotonic` is forwarded to `evaluate_model`, which checks
+    it between batches and raises `EvalDeadlineExceeded` cleanly. The
+    caller's `with` block then unwinds and releases the lock — no
+    orphaned in-flight thread.
 
-    Returns a `MinerEvalJob` on success (so the caller can later use
-    `model_path` for gradient aggregation), or None on failure.
+    Used by `BackgroundEvalWorker` so a `wait_for` cancellation cannot
+    leave a half-loaded model on GPU. Foreground callers should use the
+    async wrapper below.
     """
     try:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        miner_model = await asyncio.to_thread(load_model_from_path, str(model_path), base_model, device)
+        miner_model = load_model_from_path(str(model_path), base_model, device)
 
         try:
-            metrics = await _evaluate_on_fresh_loader(
+            metrics = _evaluate_on_fresh_loader_sync(
                 config=config,
                 tokenizer=tokenizer,
                 combinded_seed=combined_seed,
@@ -707,6 +738,7 @@ async def evaluate_one_miner(
                 device=device,
                 max_eval_batches=max_eval_batches,
                 rank=rank,
+                deadline_monotonic=deadline_monotonic,
             )
         finally:
             del miner_model
@@ -747,6 +779,16 @@ async def evaluate_one_miner(
             step=int(step),
             score=float(score),
         )
+    except EvalDeadlineExceeded as e:
+        logger.warning(
+            "evaluate_one_miner: deadline exceeded — bailing cleanly",
+            uid=int(uid), hotkey=hotkey[:6], round_id=round_id, error=str(e),
+        )
+        inc_eval_failure(int(uid), "deadline")
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return None
     except torch.cuda.OutOfMemoryError:
         logger.error("evaluate_one_miner: OOM", uid=int(uid))
         inc_eval_failure(int(uid), "oom")
@@ -765,6 +807,47 @@ async def evaluate_one_miner(
         logger.exception("evaluate_one_miner: failed", uid=int(uid), error=str(e))
         inc_eval_failure(int(uid), "unknown")
         return None
+
+
+async def evaluate_one_miner(
+    *,
+    config,
+    model_path: str | Path,
+    uid: int,
+    hotkey: str,
+    base_model: nn.Module,
+    tokenizer,
+    combined_seed: str,
+    device: torch.device,
+    baseline_loss: float,
+    step: int,
+    round_id: int | None = None,
+    max_eval_batches: int = EVAL_MAX_BATCHES,
+    rank: int | None = None,
+) -> "MinerEvalJob | None":
+    """Async wrapper around `evaluate_one_miner_sync`.
+
+    Used by foreground eval, which doesn't share `gpu_eval_lock` with
+    bg-eval and benefits from the `await` releasing the event loop while
+    GPU work runs. Bg-eval calls the sync version directly so the lock
+    can be acquired *inside* the threadpool task.
+    """
+    return await asyncio.to_thread(
+        evaluate_one_miner_sync,
+        config=config,
+        model_path=model_path,
+        uid=uid,
+        hotkey=hotkey,
+        base_model=base_model,
+        tokenizer=tokenizer,
+        combined_seed=combined_seed,
+        device=device,
+        baseline_loss=baseline_loss,
+        step=step,
+        round_id=round_id,
+        max_eval_batches=max_eval_batches,
+        rank=rank,
+    )
 
 
 async def evaluate_foreground_round(

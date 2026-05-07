@@ -712,6 +712,57 @@ class TestBackgroundEvalWorker:
             worker.join(timeout=5)
             assert not worker.is_alive(), "Worker did not stop"
 
+    def test_stuck_lock_recycles_eval_base_model(self, tmp_path: Path) -> None:
+        """Simulate a leaked `gpu_eval_lock` by holding it from the test
+        thread for several iterations. The worker must hit its recycle
+        threshold, drop `_eval_base_model`, and re-park (its
+        `has_eval_base_model()` returns False) instead of wedging
+        forever.
+        """
+        config = _fake_validator_config()
+        metagraph = _make_metagraph({"hk_a": 0.5})
+        assignment = {"vhk": ["hk_a"]}
+        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, round_id=100)
+
+        ref = RoundRef()
+        ref.swap(new_current=rnd)
+        worker, gpu_lock, merge_active, eval_window, stop = self._build_worker(
+            round_ref=ref,
+        )
+        # Lower threshold and poll so the test can finish in a couple of
+        # seconds without depending on real timing.
+        worker.stuck_lock_recycle_threshold = 2
+        worker.poll_interval_sec = 0.05
+        # Pretend the round snapshot is already loaded — otherwise the
+        # very first iteration would call `_load_round_snapshot`, which
+        # itself acquires `gpu_eval_lock` and would block on the
+        # simulated orphan before the recycler ever runs. In production
+        # the wedge happens *after* a round has been loaded; this matches
+        # that state.
+        worker._loaded_round_id = rnd.round_id
+        worker._loaded_baseline_loss = 0.0
+        # Open the gates so the worker reaches `_stuck_lock_check_*`
+        # rather than staying parked on merge/eval-window.
+        eval_window.set()
+        assert worker.has_eval_base_model(), "worker must start seeded"
+
+        # Hold the lock from the test thread to simulate an orphan.
+        gpu_lock.acquire()
+        worker.start()
+        try:
+            # Recycle should fire within ~threshold * poll * 2 seconds.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and worker.has_eval_base_model():
+                time.sleep(0.05)
+            assert not worker.has_eval_base_model(), (
+                "worker did not drop eval_base_model after stuck-lock streak"
+            )
+        finally:
+            stop.set()
+            gpu_lock.release()
+            worker.join(timeout=5)
+            assert not worker.is_alive(), "Worker did not stop"
+
 
 # ---------------------------------------------------------------------------
 # (4) Penalty pass + delayed weight submission flow at top of cycle
