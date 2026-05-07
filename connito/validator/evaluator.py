@@ -634,21 +634,32 @@ def _evaluate_on_fresh_loader_sync(
     max_eval_batches: int,
     rank: int | None = None,
     deadline_monotonic: float | None = None,
+    cached_batches: list | None = None,
 ) -> dict:
     """Synchronous variant of `_evaluate_on_fresh_loader`.
 
-    Builds the dataloader and runs `evaluate_model` on the same thread.
+    Runs `evaluate_model` on the same thread the caller is executing on.
     Used by `evaluate_one_miner_sync` so the entire GPU pipeline can run
-    inside a single threadpool task that owns `gpu_eval_lock`. The async
-    variant below is a thin wrapper around this for foreground callers.
+    inside a single threadpool task that owns `gpu_eval_lock`.
+
+    If `cached_batches` is provided, iterates the cached list (CPU
+    tensors, materialized once per round by `materialize_batches`) and
+    skips `get_dataloader` entirely. This keeps HF streaming off the
+    per-miner critical path — the trigger for the bg-eval lock-leak
+    wedge observed in production logs. Falls back to a fresh streaming
+    dataloader when the cache is absent (foreground eval, first miner
+    of a fresh worker, etc.).
     """
-    dataloader = get_dataloader(
-        config=config,
-        tokenizer=tokenizer,
-        seed=combinded_seed,
-        rank=0,
-        world_size=config.dataloader.world_size,
-    )
+    if cached_batches is not None:
+        dataloader = cached_batches
+    else:
+        dataloader = get_dataloader(
+            config=config,
+            tokenizer=tokenizer,
+            seed=combinded_seed,
+            rank=0,
+            world_size=config.dataloader.world_size,
+        )
     try:
         @track_eval_latency()
         def _run():
@@ -658,7 +669,8 @@ def _evaluate_on_fresh_loader_sync(
             )
         return _run()
     finally:
-        del dataloader
+        if cached_batches is None:
+            del dataloader
 
 
 async def _evaluate_on_fresh_loader(
@@ -704,6 +716,7 @@ def evaluate_one_miner_sync(
     max_eval_batches: int = EVAL_MAX_BATCHES,
     rank: int | None = None,
     deadline_monotonic: float | None = None,
+    cached_batches: list | None = None,
 ) -> "MinerEvalJob | None":
     """Synchronous variant of `evaluate_one_miner`.
 
@@ -739,6 +752,7 @@ def evaluate_one_miner_sync(
                 max_eval_batches=max_eval_batches,
                 rank=rank,
                 deadline_monotonic=deadline_monotonic,
+                cached_batches=cached_batches,
             )
         finally:
             del miner_model

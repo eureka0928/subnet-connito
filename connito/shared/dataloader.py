@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+import itertools
+import os
+from collections.abc import Callable, Iterable
 from functools import partial
 from typing import Any
 
@@ -12,6 +14,17 @@ from transformers import DataCollator, DataCollatorForLanguageModeling, PreTrain
 
 from connito.shared.app_logging import structlog
 from connito.shared.helper import h256_int, import_from_string
+
+# Default per-request timeout for HuggingFace Hub network reads. Bg-eval's
+# dataloader streams from HF, and a hung connection inside the streaming
+# iterator can park a worker thread inside an uncancellable network read
+# — observed as the trigger for the bg-eval lock-leak wedges in
+# `notebooks/data/validator_a100_v0.1.38.log` (uid 82, 01:35:59) and
+# `validator_A6000_v0.1.38.log` (uid 50, 23:32:43). A 30 s ceiling lets
+# requests/urllib3 raise on stalled reads instead of hanging until the
+# OS-level TCP RST, so the eval loop unwinds cleanly via
+# `EvalDeadlineExceeded` instead of orphaning `gpu_eval_lock`.
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
 
 logger = structlog.get_logger(__name__)
 
@@ -314,3 +327,30 @@ def get_dataloader(
         num_workers=num_workers,
     )
     return loader
+
+
+def materialize_batches(
+    dataloader: Iterable, max_batches: int,
+) -> list:
+    """Pull up to ``max_batches + 1`` batches from a (possibly streaming)
+    dataloader into a Python list, leaving HF off the per-miner critical path.
+
+    Bg-eval re-evaluates every miner in a round against the same combined
+    seed, so every miner sees the same batches. Materializing once at
+    round start and iterating from RAM for each miner has two wins:
+
+    1. **Eliminates HF network from the per-miner path.** A hung HF read
+       inside the streaming iterator cannot stall a per-miner eval and
+       trigger the orphan-lock cascade observed in
+       `notebooks/data/validator_a100_v0.1.38.log`.
+    2. **Removes redundant work.** Each miner currently rebuilds the
+       dataloader and re-streams the same batches; collapsing to a
+       single materialization pays the network cost once per round.
+
+    The ``+1`` mirrors the loop guard inside ``evaluate_model``: it
+    breaks ``if batch_step >= max_eval_batches``, so we keep one extra
+    batch around to cover the off-by-one without it ever being scored.
+    Tensors are kept on CPU here; ``evaluate_model`` moves them to the
+    GPU per-batch as before.
+    """
+    return list(itertools.islice(dataloader, max_batches + 1))

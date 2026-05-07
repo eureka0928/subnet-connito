@@ -94,6 +94,12 @@ class BackgroundEvalWorker(threading.Thread):
         self._eval_base_model_lock = threading.Lock()
         self._loaded_round_id: int | None = None
         self._loaded_baseline_loss: float | None = None
+        # Round-scoped cache of materialized eval batches. Built once in
+        # `_load_round_snapshot` from the streaming dataloader, then
+        # iterated by every miner's eval this round. Same combined seed
+        # → same batches, so per-miner re-streaming was wasted work AND
+        # the trigger for the HF-stall lock-leak.
+        self._cached_batches: list | None = None
         # Stuck-lock detection: incremented every iteration that observes
         # `gpu_eval_lock` held at the top-of-loop assertion, reset to 0
         # on any successful (or even attempted) eval iteration. When the
@@ -222,6 +228,7 @@ class BackgroundEvalWorker(threading.Thread):
             try:
                 del self._eval_base_model
                 self._eval_base_model = None
+                self._cached_batches = None
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             except Exception:
@@ -254,14 +261,27 @@ class BackgroundEvalWorker(threading.Thread):
             await asyncio.sleep(0.5)
 
     async def _load_round_snapshot(self, round_obj) -> None:
-        """Load the round's CPU snapshot into our GPU eval_base_model.
+        """Load the round's CPU snapshot into our GPU eval_base_model,
+        materialize the round's eval batches once, and compute baseline.
 
-        Holds gpu_eval_lock only for the duration of load_state_dict.
+        Holds `gpu_eval_lock` only for the duration of `load_state_dict`
+        and the baseline forward pass. The dataloader is *materialized*
+        — i.e., all batches are pulled into a CPU-side list — so every
+        subsequent miner this round iterates from RAM instead of the HF
+        streaming endpoint. Removes HF from the per-miner critical path
+        and eliminates the lock-leak trigger seen in production
+        (a hung HF read inside `for batch in dataloader:`).
         """
         # Lazy imports keep this module loadable without the heavy
         # datasets/pandas chain at module-import time (helps tests).
-        from connito.shared.dataloader import get_dataloader
+        from connito.shared.dataloader import get_dataloader, materialize_batches
         from connito.shared.evaluate import evaluate_model
+
+        # Drop any previous round's cached batches before loading the new
+        # round's. The CPU-side tensor list can run to several hundred MB
+        # for a full 50-batch window — leaking it across rounds compounds
+        # under restart-replay scenarios.
+        self._cached_batches = None
 
         def _load() -> None:
             with self.gpu_eval_lock:
@@ -270,25 +290,42 @@ class BackgroundEvalWorker(threading.Thread):
                     torch.cuda.synchronize()
 
         await asyncio.to_thread(_load)
-        # Recompute the baseline loss for this round once.
-        try:
-            dataloader = await asyncio.to_thread(
-                get_dataloader,
+
+        # Build the dataloader and pull all batches into RAM up-front.
+        # Both steps are wrapped in to_thread so the event loop stays
+        # free; if HF is unreachable, the build/materialize raises and
+        # we fall back to an unscored baseline rather than wedging.
+        def _build_and_materialize() -> list:
+            dl = get_dataloader(
                 config=self.config,
                 tokenizer=self.tokenizer,
                 seed=round_obj.seed,
                 rank=0,
                 world_size=self.config.dataloader.world_size,
             )
+            try:
+                return materialize_batches(dl, EVAL_MAX_BATCHES)
+            finally:
+                del dl
+
+        try:
+            self._cached_batches = await asyncio.to_thread(_build_and_materialize)
         except Exception as e:
-            logger.warning("bg-eval: dataloader build failed; using fallback baseline", error=str(e))
+            logger.warning(
+                "bg-eval: dataloader build/materialize failed; using fallback baseline",
+                error=str(e),
+            )
+            self._cached_batches = None
             self._loaded_baseline_loss = 100.0
             self._loaded_round_id = round_obj.round_id
             return
 
         def _baseline() -> float:
             with self.gpu_eval_lock:
-                metrics = evaluate_model(0, self._eval_base_model, dataloader, self.device, EVAL_MAX_BATCHES, None)
+                metrics = evaluate_model(
+                    0, self._eval_base_model, self._cached_batches,
+                    self.device, EVAL_MAX_BATCHES, None,
+                )
             return float(metrics.get("val_loss", 100))
 
         try:
@@ -296,14 +333,15 @@ class BackgroundEvalWorker(threading.Thread):
         except Exception as e:
             logger.warning("bg-eval: baseline failed; using fallback", error=str(e))
             self._loaded_baseline_loss = 100.0
-        finally:
-            del dataloader
 
         self._loaded_round_id = round_obj.round_id
         logger.info(
             "bg-eval: round snapshot loaded",
             round_id=round_obj.round_id,
             baseline_loss=round(self._loaded_baseline_loss or 0.0, 4),
+            cached_batches=(
+                len(self._cached_batches) if self._cached_batches is not None else 0
+            ),
         )
 
     async def _evaluate_one(self, round_obj, *, uid: int, hotkey: str) -> None:
@@ -400,6 +438,7 @@ class BackgroundEvalWorker(threading.Thread):
                     step=round_obj.round_id,
                     round_id=round_obj.round_id,
                     deadline_monotonic=deadline,
+                    cached_batches=self._cached_batches,
                 )
 
         try:
@@ -502,6 +541,7 @@ class BackgroundEvalWorker(threading.Thread):
             self._eval_base_model = None
         self._loaded_round_id = None
         self._loaded_baseline_loss = None
+        self._cached_batches = None
         self._stuck_lock_streak = 0
         try:
             VALIDATOR_BG_EVAL_STUCK_LOCK_ITERATIONS.set(0)

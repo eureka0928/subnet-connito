@@ -45,7 +45,14 @@ def _install_stub_if_unavailable(mod_path: str, attrs: dict) -> None:
 
 _install_stub_if_unavailable(
     "connito.shared.dataloader",
-    {"get_dataloader": lambda **kwargs: None},
+    {
+        "get_dataloader": lambda **kwargs: None,
+        # Mirror the real `materialize_batches`: pull up to
+        # `max_batches + 1` items from any iterable into a list.
+        "materialize_batches": lambda dataloader, max_batches: list(
+            __import__("itertools").islice(dataloader, max_batches + 1)
+        ),
+    },
 )
 _install_stub_if_unavailable(
     "connito.shared.evaluate",
@@ -762,6 +769,61 @@ class TestBackgroundEvalWorker:
             gpu_lock.release()
             worker.join(timeout=5)
             assert not worker.is_alive(), "Worker did not stop"
+
+
+class TestMaterializeBatches:
+    """Unit-level checks for the round-level dataloader cache.
+
+    The cache is the structural fix for the HF-stall lock-leak: every
+    miner in a round shares the same combined seed, so the streaming
+    dataloader yields the same batches. Pulling them once at round
+    start and iterating from RAM keeps HF off the per-miner critical
+    path. These tests don't spin up a full worker — they exercise the
+    helper directly so they can run without bittensor/datasets
+    available.
+    """
+
+    def test_materialize_batches_pulls_max_plus_one(self) -> None:
+        from connito.shared.dataloader import materialize_batches
+
+        # An "infinite" iterable; verify the helper bounds the pull.
+        # +1 mirrors the off-by-one inside `evaluate_model`'s break.
+        def _gen():
+            i = 0
+            while True:
+                yield {"i": i}
+                i += 1
+
+        out = materialize_batches(_gen(), max_batches=4)
+        assert len(out) == 5  # 4 + 1
+        assert [b["i"] for b in out] == [0, 1, 2, 3, 4]
+
+    def test_materialize_batches_truncated_source(self) -> None:
+        """Streaming dataset shorter than `max_batches` is fine — we
+        just take what's there. No padding, no error."""
+        from connito.shared.dataloader import materialize_batches
+
+        out = materialize_batches(iter([{"i": 0}, {"i": 1}]), max_batches=10)
+        assert len(out) == 2
+
+    def test_hf_hub_download_timeout_default_set(self) -> None:
+        """Importing the dataloader module sets `HF_HUB_DOWNLOAD_TIMEOUT`
+        as a safety net for hung HF reads inside the streaming
+        iterator. The value chosen (30 s) is what unblocks bg-eval
+        when HF.co is briefly unreachable, instead of orphaning
+        `gpu_eval_lock` for hours."""
+        import importlib
+        import os
+        try:
+            mod = importlib.import_module("connito.shared.dataloader")
+        except ImportError:
+            pytest.skip("dataloader module unavailable in this env (stubbed)")
+        # If we got the real module, its top-level setdefault ran on
+        # import. If it's a stub, this test isn't meaningful — skip.
+        if not getattr(mod, "__file__", "").endswith("dataloader.py"):
+            pytest.skip("dataloader module is stubbed")
+        assert os.environ.get("HF_HUB_DOWNLOAD_TIMEOUT") is not None
+        assert int(os.environ["HF_HUB_DOWNLOAD_TIMEOUT"]) > 0
 
 
 # ---------------------------------------------------------------------------
