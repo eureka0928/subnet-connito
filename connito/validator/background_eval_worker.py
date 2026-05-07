@@ -447,15 +447,24 @@ class BackgroundEvalWorker(threading.Thread):
         )
 
         # Run the entire eval inside one threadpool task and acquire
-        # `gpu_eval_lock` INSIDE that thread, so lock release is coupled
-        # to actual GPU completion (not awaiter cancellation). To cover
-        # the case where the eval genuinely stalls on GPU, we forward an
-        # in-thread deadline to `evaluate_model`, which raises
-        # `EvalDeadlineExceeded` between batches and unwinds the `with
-        # lock:` block cleanly. The outer `wait_for` is given a small
-        # grace window past that deadline so the in-thread check fires
-        # first; if the awaiter still times out, the thread is wedged
-        # and the recycler in `_loop` will catch it.
+        # `gpu_eval_lock` INSIDE that thread. This couples lock release
+        # to actual GPU completion (not awaiter cancellation): when
+        # `wait_for` cancels the awaiter on timeout, the threadpool task
+        # keeps running (`asyncio.to_thread` tasks aren't cancellable),
+        # so the lock stays held until GPU work finishes. The next
+        # eval's `to_thread(_run_eval)` call blocks on `gpu_eval_lock`
+        # inside its own thread until the timed-out thread drains —
+        # preventing two concurrent miner-model allocations on a single
+        # GPU (the OOM cascade observed when cancellation released the
+        # lock mid-thread).
+        #
+        # To cover the case where the eval genuinely stalls on GPU, we
+        # forward an in-thread deadline to `evaluate_model`, which
+        # raises `EvalDeadlineExceeded` between batches and unwinds the
+        # `with lock:` block cleanly. The outer `wait_for` is given a
+        # small grace window past that deadline so the in-thread check
+        # fires first; if the awaiter still times out, the thread is
+        # wedged and the recycler in `_loop` will catch it.
         deadline = time.monotonic() + timeout
         outer_timeout = timeout + EVAL_DEADLINE_GRACE_SEC
 
