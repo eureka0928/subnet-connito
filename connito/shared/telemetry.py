@@ -136,6 +136,11 @@ VALIDATOR_CURRENT_ROUND_ID = Gauge(
 )
 VALIDATOR_SCORE_STD = Gauge("validator_score_std", "Spread of miner scores")
 VALIDATOR_AVG_STEP_STATUS = Counter("validator_avg_step_status", "Averager sync step stats", ["status"])
+# Pre-init the fixed status enum so the counter is visible in /metrics from
+# process start instead of only after the first averager step. prometheus_client
+# omits labeled metrics that have never had .labels() called.
+for _status in ("success", "timeout", "error"):
+    VALIDATOR_AVG_STEP_STATUS.labels(status=_status)
 VALIDATOR_EVAL_LOSS = Gauge("validator_eval_loss", "Evaluation loss", ["expert_group"])
 VALIDATOR_EVAL_BATCH_COUNT = Counter("validator_eval_batch_count", "Evaluation batch count")
 VALIDATOR_HEARTBEAT_TOTAL = Counter(
@@ -177,6 +182,20 @@ VALIDATOR_BG_WORKER_PAUSED = Gauge(
     "validator_bg_worker_paused",
     "1 while a background worker is paused on merge_phase_active / eval_window / download_window",
     ["worker"],
+)
+VALIDATOR_BG_EVAL_LOCK_LEAK_TOTAL = Counter(
+    "validator_bg_eval_lock_leak_total",
+    "Bg-eval timeouts that left gpu_eval_lock held by an in-flight thread",
+    ["round_id"],
+)
+VALIDATOR_BG_EVAL_STUCK_LOCK_ITERATIONS = Gauge(
+    "validator_bg_eval_stuck_lock_iterations",
+    "Consecutive bg-eval iterations observing gpu_eval_lock held at iteration boundary; "
+    "0 in steady state, escalates to a recycle when threshold is crossed",
+)
+VALIDATOR_BG_EVAL_RECYCLE_TOTAL = Counter(
+    "validator_bg_eval_recycle_total",
+    "Times bg-eval dropped its eval_base_model after a stuck-lock streak",
 )
 
 # Miner (Gauges)

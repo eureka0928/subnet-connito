@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import time
 
 import torch
 from torch import nn
@@ -13,6 +14,17 @@ logger = structlog.getLogger(__name__)
 tqdm(disable=True, total=0)
 
 
+class EvalDeadlineExceeded(RuntimeError):
+    """Raised by `evaluate_model` when its `deadline_monotonic` is crossed.
+
+    Distinct from `asyncio.TimeoutError` so callers running the eval
+    inside a thread (and therefore unable to be cancelled by
+    `asyncio.wait_for`) can surface the deadline as a normal exception
+    that unwinds locks via `with`/`finally`, instead of letting an
+    awaiter cancellation orphan an in-flight GPU thread.
+    """
+
+
 def evaluate_model(
     step: int,
     model: nn.Module,
@@ -20,6 +32,7 @@ def evaluate_model(
     device: torch.device,
     max_eval_batches: int | None = 50,
     rank: int | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, float]:
     """
     Run a lightweight eval pass and return scalar metrics.
@@ -61,6 +74,16 @@ def evaluate_model(
     batch_step = -1
     with torch.no_grad():
         for batch_step, batch in enumerate(iterable=eval_dataloader):
+            # Per-batch deadline check. Raised before we start GPU work
+            # for this batch so the caller's `with lock:` unwinds without
+            # leaving an in-flight allocation. Granularity is one batch —
+            # the eval loop cannot interrupt mid-forward — so the
+            # effective bound is `deadline + one_batch_wall_time`.
+            if deadline_monotonic is not None and time.monotonic() > deadline_monotonic:
+                raise EvalDeadlineExceeded(
+                    f"evaluate_model deadline exceeded at batch={batch_step} "
+                    f"step={step} scored_batches={scored_batches}"
+                )
             device_batch = {}
             for key in batch.keys():
                 device_batch[key] = batch[key].to(model.device)

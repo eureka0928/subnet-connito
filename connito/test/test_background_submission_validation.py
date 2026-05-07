@@ -45,7 +45,14 @@ def _install_stub_if_unavailable(mod_path: str, attrs: dict) -> None:
 
 _install_stub_if_unavailable(
     "connito.shared.dataloader",
-    {"get_dataloader": lambda **kwargs: None},
+    {
+        "get_dataloader": lambda **kwargs: None,
+        # Mirror the real `materialize_batches`: pull up to
+        # `max_batches + 1` items from any iterable into a list.
+        "materialize_batches": lambda dataloader, max_batches: list(
+            __import__("itertools").islice(dataloader, max_batches + 1)
+        ),
+    },
 )
 _install_stub_if_unavailable(
     "connito.shared.evaluate",
@@ -711,6 +718,130 @@ class TestBackgroundEvalWorker:
             eval_window.set()
             worker.join(timeout=5)
             assert not worker.is_alive(), "Worker did not stop"
+
+    def test_stuck_lock_recycles_eval_base_model(self, tmp_path: Path) -> None:
+        """Simulate a leaked `gpu_eval_lock` by holding it from the test
+        thread for several iterations. The worker must hit its recycle
+        threshold, drop `_eval_base_model`, and re-park (its
+        `has_eval_base_model()` returns False) instead of wedging
+        forever.
+        """
+        config = _fake_validator_config()
+        metagraph = _make_metagraph({"hk_a": 0.5})
+        assignment = {"vhk": ["hk_a"]}
+        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, round_id=100)
+
+        ref = RoundRef()
+        ref.swap(new_current=rnd)
+        worker, gpu_lock, merge_active, eval_window, stop = self._build_worker(
+            round_ref=ref,
+        )
+        # Lower threshold and poll so the test can finish in a couple of
+        # seconds without depending on real timing.
+        worker.stuck_lock_recycle_threshold = 2
+        worker.poll_interval_sec = 0.05
+        # Pretend the round snapshot is already loaded — otherwise the
+        # very first iteration would call `_load_round_snapshot`, which
+        # itself acquires `gpu_eval_lock` and would block on the
+        # simulated orphan before the recycler ever runs. In production
+        # the wedge happens *after* a round has been loaded; this matches
+        # that state.
+        worker._loaded_round_id = rnd.round_id
+        worker._loaded_baseline_loss = 0.0
+        # Open the gates so the worker reaches `_stuck_lock_check_*`
+        # rather than staying parked on merge/eval-window.
+        eval_window.set()
+        assert worker.has_eval_base_model(), "worker must start seeded"
+
+        # Hold the lock from the test thread to simulate an orphan.
+        gpu_lock.acquire()
+        worker.start()
+        try:
+            # Recycle should fire within ~threshold * poll * 2 seconds.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and worker.has_eval_base_model():
+                time.sleep(0.05)
+            assert not worker.has_eval_base_model(), (
+                "worker did not drop eval_base_model after stuck-lock streak"
+            )
+        finally:
+            stop.set()
+            gpu_lock.release()
+            worker.join(timeout=5)
+            assert not worker.is_alive(), "Worker did not stop"
+
+
+class TestMaterializeBatches:
+    """Unit-level checks for the round-level dataloader cache.
+
+    The cache is the structural fix for the HF-stall lock-leak: every
+    miner in a round shares the same combined seed, so the streaming
+    dataloader yields the same batches. Pulling them once at round
+    start and iterating from RAM keeps HF off the per-miner critical
+    path. These tests don't spin up a full worker — they exercise the
+    helper directly so they can run without bittensor/datasets
+    available.
+    """
+
+    def test_materialize_batches_pulls_max_plus_one(self) -> None:
+        from connito.shared.dataloader import materialize_batches
+
+        # An "infinite" iterable; verify the helper bounds the pull.
+        # +1 mirrors the off-by-one inside `evaluate_model`'s break.
+        def _gen():
+            i = 0
+            while True:
+                yield {"i": i}
+                i += 1
+
+        out = materialize_batches(_gen(), max_batches=4)
+        assert len(out) == 5  # 4 + 1
+        assert [b["i"] for b in out] == [0, 1, 2, 3, 4]
+
+    def test_materialize_batches_truncated_source(self) -> None:
+        """Streaming dataset shorter than `max_batches` is fine — we
+        just take what's there. No padding, no error."""
+        from connito.shared.dataloader import materialize_batches
+
+        out = materialize_batches(iter([{"i": 0}, {"i": 1}]), max_batches=10)
+        assert len(out) == 2
+
+    def test_dataloader_retry_constant_shape(self) -> None:
+        """Sanity: the retry-delay tuple is bounded, monotonic, and
+        starts at 0 so the first attempt is immediate (no penalty in
+        the healthy path)."""
+        from connito.validator.background_eval_worker import (
+            DATALOADER_BUILD_RETRY_DELAYS_SEC,
+        )
+        delays = DATALOADER_BUILD_RETRY_DELAYS_SEC
+        assert len(delays) >= 2, "retry should attempt at least twice"
+        assert delays[0] == 0.0, "first attempt should be immediate"
+        assert all(b >= a for a, b in zip(delays, delays[1:])), (
+            "delays should be monotonically non-decreasing (backoff)"
+        )
+        # Total budget is bounded — must not eat a meaningful slice of
+        # the eval window. Cap at 120 s so even the worst-case retry
+        # leaves >85 min of the cycle untouched.
+        assert sum(delays) <= 120.0
+
+    def test_hf_hub_download_timeout_default_set(self) -> None:
+        """Importing the dataloader module sets `HF_HUB_DOWNLOAD_TIMEOUT`
+        as a safety net for hung HF reads inside the streaming
+        iterator. The value chosen (30 s) is what unblocks bg-eval
+        when HF.co is briefly unreachable, instead of orphaning
+        `gpu_eval_lock` for hours."""
+        import importlib
+        import os
+        try:
+            mod = importlib.import_module("connito.shared.dataloader")
+        except ImportError:
+            pytest.skip("dataloader module unavailable in this env (stubbed)")
+        # If we got the real module, its top-level setdefault ran on
+        # import. If it's a stub, this test isn't meaningful — skip.
+        if not getattr(mod, "__file__", "").endswith("dataloader.py"):
+            pytest.skip("dataloader module is stubbed")
+        assert os.environ.get("HF_HUB_DOWNLOAD_TIMEOUT") is not None
+        assert int(os.environ["HF_HUB_DOWNLOAD_TIMEOUT"]) > 0
 
 
 # ---------------------------------------------------------------------------
