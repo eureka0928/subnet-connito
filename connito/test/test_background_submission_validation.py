@@ -806,6 +806,24 @@ class TestMaterializeBatches:
         out = materialize_batches(iter([{"i": 0}, {"i": 1}]), max_batches=10)
         assert len(out) == 2
 
+    def test_dataloader_retry_constant_shape(self) -> None:
+        """Sanity: the retry-delay tuple is bounded, monotonic, and
+        starts at 0 so the first attempt is immediate (no penalty in
+        the healthy path)."""
+        from connito.validator.background_eval_worker import (
+            DATALOADER_BUILD_RETRY_DELAYS_SEC,
+        )
+        delays = DATALOADER_BUILD_RETRY_DELAYS_SEC
+        assert len(delays) >= 2, "retry should attempt at least twice"
+        assert delays[0] == 0.0, "first attempt should be immediate"
+        assert all(b >= a for a, b in zip(delays, delays[1:])), (
+            "delays should be monotonically non-decreasing (backoff)"
+        )
+        # Total budget is bounded — must not eat a meaningful slice of
+        # the eval window. Cap at 120 s so even the worst-case retry
+        # leaves >85 min of the cycle untouched.
+        assert sum(delays) <= 120.0
+
     def test_hf_hub_download_timeout_default_set(self) -> None:
         """Importing the dataloader module sets `HF_HUB_DOWNLOAD_TIMEOUT`
         as a safety net for hung HF reads inside the streaming

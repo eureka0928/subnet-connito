@@ -56,6 +56,16 @@ DEFAULT_STUCK_LOCK_RECYCLE_THRESHOLD = 3
 # thread is genuinely stuck and the recycler will catch it.
 EVAL_DEADLINE_GRACE_SEC = 30.0
 
+# Backoff delays (seconds) between dataloader build/materialize attempts
+# inside `_load_round_snapshot`. Total budget ~40 s — short enough that
+# the retry loop never bites into the eval window meaningfully (cycle is
+# ~90 min), long enough to absorb transient HF blips of the sort that
+# triggered the lock-leak wedges (single timeout, recovered seconds
+# later). After exhausting retries, fall back to the degraded baseline
+# path so the round still finalizes — just with poorer scoring fidelity
+# rather than indefinite retries.
+DATALOADER_BUILD_RETRY_DELAYS_SEC: tuple[float, ...] = (0.0, 10.0, 30.0)
+
 logger = structlog.get_logger(__name__)
 
 
@@ -294,7 +304,11 @@ class BackgroundEvalWorker(threading.Thread):
         # Build the dataloader and pull all batches into RAM up-front.
         # Both steps are wrapped in to_thread so the event loop stays
         # free; if HF is unreachable, the build/materialize raises and
-        # we fall back to an unscored baseline rather than wedging.
+        # we retry with backoff before falling back to an unscored
+        # baseline. Transient HF blips (the trigger for the lock-leak
+        # wedges) typically resolve in seconds; bounded retry keeps the
+        # round in normal scoring mode without dragging it into
+        # degraded mode on the first failed attempt.
         def _build_and_materialize() -> list:
             dl = get_dataloader(
                 config=self.config,
@@ -308,12 +322,34 @@ class BackgroundEvalWorker(threading.Thread):
             finally:
                 del dl
 
-        try:
-            self._cached_batches = await asyncio.to_thread(_build_and_materialize)
-        except Exception as e:
+        last_error: Exception | None = None
+        for attempt, delay in enumerate(DATALOADER_BUILD_RETRY_DELAYS_SEC):
+            if delay > 0:
+                logger.info(
+                    "bg-eval: backing off before retrying dataloader build",
+                    attempt=attempt + 1,
+                    of=len(DATALOADER_BUILD_RETRY_DELAYS_SEC),
+                    delay_sec=delay,
+                )
+                await asyncio.sleep(delay)
+            try:
+                self._cached_batches = await asyncio.to_thread(_build_and_materialize)
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "bg-eval: dataloader build/materialize failed",
+                    attempt=attempt + 1,
+                    of=len(DATALOADER_BUILD_RETRY_DELAYS_SEC),
+                    error=str(e),
+                )
+
+        if last_error is not None:
             logger.warning(
-                "bg-eval: dataloader build/materialize failed; using fallback baseline",
-                error=str(e),
+                "bg-eval: dataloader build exhausted retries; using fallback baseline",
+                attempts=len(DATALOADER_BUILD_RETRY_DELAYS_SEC),
+                error=str(last_error),
             )
             self._cached_batches = None
             self._loaded_baseline_loss = 100.0
