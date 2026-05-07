@@ -380,13 +380,13 @@ def build_submission_uid_weights(
     Cohort emission rule (when all four are present):
       * Group 1 (`cfg.weight_group_1_share`): top-`weight_group_1_size`
         of A∪B by aggregator avg, restricted to UIDs with
-        `record_count >= 3` AND a score recorded in BOTH the current
+        `record_count >= 2` AND a score recorded in BOTH the current
         and previous rounds. Empty-G1 guard: if no UID clears,
         redirect to `uid = 0` (subnet owner) so the validator stays
         at full emission.
       * Group 2 (`cfg.weight_group_2_share`): top-`weight_group_2_size`
         of A∪B∪C \\ G1 by aggregator avg, restricted to UIDs with
-        `record_count >= 2` (no recency gate).
+        `record_count >= 1` (no recency gate).
 
     With any of the four cohort inputs missing (cold-start replay
     before disk has a CohortState, legacy non-cohort rounds, etc.) the
@@ -410,7 +410,7 @@ def build_submission_uid_weights(
 
     ab_qualified = [
         u for u in ab_uids
-        if score_aggregator.record_count(u) >= 3
+        if score_aggregator.record_count(u) >= 2
         and score_aggregator.has_round_ids(u, g1_required_rids)
     ]
     g1 = _rg.select_top_n_by_local_score(
@@ -426,7 +426,7 @@ def build_submission_uid_weights(
     g2_pool = [
         u for u in abc_uids
         if u not in g1_set
-        and score_aggregator.record_count(u) >= 2
+        and score_aggregator.record_count(u) >= 1
     ]
     g2 = _rg.select_top_n_by_local_score(
         g2_pool,
